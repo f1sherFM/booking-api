@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Environment files
+.env
+
+# Tooling / runtime artifacts
+celerybeat-schedule
+
+# OS / editor
+.DS_Store
+Thumbs.db
