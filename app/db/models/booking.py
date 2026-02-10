@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 from enum import Enum
 
-from sqlalchemy import DateTime, ForeignKey, String, func
+from sqlalchemy import DateTime, ForeignKey, String, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -15,10 +15,14 @@ class BookingStatus(str, Enum):
 
 class Booking(Base):
     __tablename__ = "bookings"
+    __table_args__ = (
+        UniqueConstraint("client_id", "idempotency_key", name="uq_bookings_client_idempotency_key"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
     slot_id: Mapped[int] = mapped_column(ForeignKey("time_slots.id", ondelete="RESTRICT"), nullable=False, index=True)
     client_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=False, index=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default=BookingStatus.CONFIRMED.value)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

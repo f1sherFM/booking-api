@@ -271,6 +271,210 @@ def test_booking_create_and_conflict(client):
     assert second.json()["detail"] == "Slot already booked"
 
 
+def test_booking_create_is_idempotent_with_header(client):
+    specialist_payload = {
+        "email": "idem-spec@example.com",
+        "password": "StrongPass123",
+        "role": "specialist",
+    }
+    client.post("/auth/register", json=specialist_payload)
+    specialist_login = client.post(
+        "/auth/login",
+        json={"email": specialist_payload["email"], "password": specialist_payload["password"]},
+    )
+    specialist_token = specialist_login.json()["access_token"]
+    slot = client.post(
+        "/specialists/me/slots",
+        headers={"Authorization": f"Bearer {specialist_token}"},
+        json={"start_at": "2026-02-15T12:00:00Z", "end_at": "2026-02-15T13:00:00Z"},
+    ).json()
+
+    client_payload = {
+        "email": "idem-client@example.com",
+        "password": "StrongPass123",
+        "role": "client",
+    }
+    client.post("/auth/register", json=client_payload)
+    client_login = client.post(
+        "/auth/login",
+        json={"email": client_payload["email"], "password": client_payload["password"]},
+    )
+    client_token = client_login.json()["access_token"]
+    headers = {
+        "Authorization": f"Bearer {client_token}",
+        "Idempotency-Key": "booking-idem-001",
+    }
+
+    first = client.post("/bookings", headers=headers, json={"slot_id": slot["id"]})
+    second = client.post("/bookings", headers=headers, json={"slot_id": slot["id"]})
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert second.json()["id"] == first.json()["id"]
+
+    bookings = client.get("/bookings/me", headers={"Authorization": f"Bearer {client_token}"})
+    assert bookings.status_code == 200
+    assert len(bookings.json()) == 1
+
+
+def test_booking_idempotency_key_reuse_with_different_slot_returns_409(client):
+    specialist_payload = {
+        "email": "idem-reuse-spec@example.com",
+        "password": "StrongPass123",
+        "role": "specialist",
+    }
+    client.post("/auth/register", json=specialist_payload)
+    specialist_login = client.post(
+        "/auth/login",
+        json={"email": specialist_payload["email"], "password": specialist_payload["password"]},
+    )
+    specialist_token = specialist_login.json()["access_token"]
+    slot1 = client.post(
+        "/specialists/me/slots",
+        headers={"Authorization": f"Bearer {specialist_token}"},
+        json={"start_at": "2026-02-15T14:00:00Z", "end_at": "2026-02-15T15:00:00Z"},
+    ).json()
+    slot2 = client.post(
+        "/specialists/me/slots",
+        headers={"Authorization": f"Bearer {specialist_token}"},
+        json={"start_at": "2026-02-15T16:00:00Z", "end_at": "2026-02-15T17:00:00Z"},
+    ).json()
+
+    client_payload = {
+        "email": "idem-reuse-client@example.com",
+        "password": "StrongPass123",
+        "role": "client",
+    }
+    client.post("/auth/register", json=client_payload)
+    client_login = client.post(
+        "/auth/login",
+        json={"email": client_payload["email"], "password": client_payload["password"]},
+    )
+    client_token = client_login.json()["access_token"]
+    headers = {
+        "Authorization": f"Bearer {client_token}",
+        "Idempotency-Key": "booking-idem-002",
+    }
+
+    first = client.post("/bookings", headers=headers, json={"slot_id": slot1["id"]})
+    reused = client.post("/bookings", headers=headers, json={"slot_id": slot2["id"]})
+
+    assert first.status_code == 201
+    assert reused.status_code == 409
+    assert reused.json()["detail"] == "Idempotency key already used with another slot"
+
+
+def test_client_can_download_booking_calendar_file(client):
+    specialist_payload = {
+        "email": "calendar-spec@example.com",
+        "password": "StrongPass123",
+        "role": "specialist",
+    }
+    client.post("/auth/register", json=specialist_payload)
+    specialist_login = client.post(
+        "/auth/login",
+        json={"email": specialist_payload["email"], "password": specialist_payload["password"]},
+    )
+    specialist_token = specialist_login.json()["access_token"]
+    slot = client.post(
+        "/specialists/me/slots",
+        headers={"Authorization": f"Bearer {specialist_token}"},
+        json={"start_at": "2026-02-22T10:00:00Z", "end_at": "2026-02-22T11:00:00Z"},
+    ).json()
+
+    client_payload = {
+        "email": "calendar-client@example.com",
+        "password": "StrongPass123",
+        "role": "client",
+    }
+    client.post("/auth/register", json=client_payload)
+    client_login = client.post(
+        "/auth/login",
+        json={"email": client_payload["email"], "password": client_payload["password"]},
+    )
+    client_token = client_login.json()["access_token"]
+
+    booking = client.post(
+        "/bookings",
+        headers={"Authorization": f"Bearer {client_token}"},
+        json={"slot_id": slot["id"]},
+    ).json()
+
+    calendar_response = client.get(
+        f"/bookings/{booking['id']}/calendar.ics",
+        headers={"Authorization": f"Bearer {client_token}"},
+    )
+
+    assert calendar_response.status_code == 200
+    assert calendar_response.headers["content-type"].startswith("text/calendar")
+    assert (
+        calendar_response.headers["content-disposition"]
+        == f'attachment; filename="booking-{booking["id"]}.ics"'
+    )
+    body = calendar_response.text
+    assert "BEGIN:VCALENDAR" in body
+    assert "BEGIN:VEVENT" in body
+    assert "SUMMARY:Booking with" in body
+    assert "DTSTART:20260222T100000Z" in body
+    assert "DTEND:20260222T110000Z" in body
+
+
+def test_other_client_cannot_download_foreign_booking_calendar_file(client):
+    specialist_payload = {
+        "email": "calendar-deny-spec@example.com",
+        "password": "StrongPass123",
+        "role": "specialist",
+    }
+    client.post("/auth/register", json=specialist_payload)
+    specialist_login = client.post(
+        "/auth/login",
+        json={"email": specialist_payload["email"], "password": specialist_payload["password"]},
+    )
+    specialist_token = specialist_login.json()["access_token"]
+    slot = client.post(
+        "/specialists/me/slots",
+        headers={"Authorization": f"Bearer {specialist_token}"},
+        json={"start_at": "2026-02-22T12:00:00Z", "end_at": "2026-02-22T13:00:00Z"},
+    ).json()
+
+    owner_payload = {
+        "email": "calendar-owner@example.com",
+        "password": "StrongPass123",
+        "role": "client",
+    }
+    client.post("/auth/register", json=owner_payload)
+    owner_login = client.post(
+        "/auth/login",
+        json={"email": owner_payload["email"], "password": owner_payload["password"]},
+    )
+    owner_token = owner_login.json()["access_token"]
+    booking = client.post(
+        "/bookings",
+        headers={"Authorization": f"Bearer {owner_token}"},
+        json={"slot_id": slot["id"]},
+    ).json()
+
+    stranger_payload = {
+        "email": "calendar-stranger@example.com",
+        "password": "StrongPass123",
+        "role": "client",
+    }
+    client.post("/auth/register", json=stranger_payload)
+    stranger_login = client.post(
+        "/auth/login",
+        json={"email": stranger_payload["email"], "password": stranger_payload["password"]},
+    )
+    stranger_token = stranger_login.json()["access_token"]
+
+    denied = client.get(
+        f"/bookings/{booking['id']}/calendar.ics",
+        headers={"Authorization": f"Bearer {stranger_token}"},
+    )
+
+    assert denied.status_code == 403
+    assert denied.json()["detail"] == "Not enough permissions"
+
+
 def test_booking_cancel_frees_slot(client):
     specialist_payload = {
         "email": "cancelspec@example.com",

@@ -8,6 +8,7 @@ from app.db.models import Booking, BookingStatus, TimeSlot
 
 LOCK_CONFLICT_DETAIL = "Slot booking is in progress. Retry the request."
 SLOT_ALREADY_BOOKED_DETAIL = "Slot already booked"
+IDEMPOTENCY_KEY_REUSE_DETAIL = "Idempotency key already used with another slot"
 PG_LOCK_NOT_AVAILABLE_SQLSTATE = "55P03"
 
 
@@ -28,8 +29,36 @@ def _is_pg_lock_not_available(exc: OperationalError) -> bool:
     return sqlstate == PG_LOCK_NOT_AVAILABLE_SQLSTATE
 
 
-def create_booking_for_slot(db: Session, slot_id: int, client_id: int) -> Booking:
+def _get_booking_by_idempotency_key(db: Session, client_id: int, idempotency_key: str) -> Booking | None:
+    return db.scalar(
+        select(Booking).where(
+            Booking.client_id == client_id,
+            Booking.idempotency_key == idempotency_key,
+        )
+    )
+
+
+def create_booking_for_slot(
+    db: Session,
+    slot_id: int,
+    client_id: int,
+    idempotency_key: str | None = None,
+) -> Booking:
     try:
+        if idempotency_key:
+            existing_booking = _get_booking_by_idempotency_key(
+                db=db,
+                client_id=client_id,
+                idempotency_key=idempotency_key,
+            )
+            if existing_booking:
+                if existing_booking.slot_id != slot_id:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=IDEMPOTENCY_KEY_REUSE_DETAIL,
+                    )
+                return existing_booking
+
         slot_query = select(TimeSlot.id).where(TimeSlot.id == slot_id)
         if _is_postgresql_session(db):
             slot_query = slot_query.with_for_update(nowait=True)
@@ -45,11 +74,25 @@ def create_booking_for_slot(db: Session, slot_id: int, client_id: int) -> Bookin
         )
         if updated.rowcount != 1:
             db.rollback()
+            if idempotency_key:
+                existing_booking = _get_booking_by_idempotency_key(
+                    db=db,
+                    client_id=client_id,
+                    idempotency_key=idempotency_key,
+                )
+                if existing_booking:
+                    if existing_booking.slot_id != slot_id:
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail=IDEMPOTENCY_KEY_REUSE_DETAIL,
+                        )
+                    return existing_booking
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=SLOT_ALREADY_BOOKED_DETAIL)
 
         booking = Booking(
             slot_id=slot_id,
             client_id=client_id,
+            idempotency_key=idempotency_key,
             status=BookingStatus.CONFIRMED.value,
         )
         db.add(booking)
@@ -63,4 +106,17 @@ def create_booking_for_slot(db: Session, slot_id: int, client_id: int) -> Bookin
         raise
     except IntegrityError:
         db.rollback()
+        if idempotency_key:
+            existing_booking = _get_booking_by_idempotency_key(
+                db=db,
+                client_id=client_id,
+                idempotency_key=idempotency_key,
+            )
+            if existing_booking:
+                if existing_booking.slot_id != slot_id:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=IDEMPOTENCY_KEY_REUSE_DETAIL,
+                    ) from None
+                return existing_booking
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=SLOT_ALREADY_BOOKED_DETAIL) from None
