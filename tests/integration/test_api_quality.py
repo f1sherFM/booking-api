@@ -9,6 +9,14 @@ def test_error_response_has_unified_shape(client):
     assert "request_id" in body
 
 
+def test_health_endpoint_returns_ok_and_request_id(client):
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert "x-request-id" in response.headers
+
+
 def test_slots_pagination_limit_offset(client):
     specialist_payload = {
         "email": "pagination-spec@example.com",

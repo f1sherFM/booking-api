@@ -1,6 +1,7 @@
 from datetime import date, datetime, time, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import Response
 from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
@@ -8,7 +9,12 @@ from app.api.deps import get_current_user, require_roles
 from app.api.pagination import LimitParam, OffsetParam
 from app.db.models import Service, SpecialistProfile, TimeSlot, User, UserRole
 from app.db.session import get_db
-from app.schemas.slot import SlotCreateRequest, SlotResponse, SpecialistProfileResponse
+from app.schemas.slot import (
+    SlotCreateRequest,
+    SlotResponse,
+    SpecialistAvailabilityDayResponse,
+    SpecialistProfileResponse,
+)
 from app.schemas.service import ServiceCreateRequest, ServiceResponse
 
 router = APIRouter(prefix="/specialists", tags=["specialists"])
@@ -109,6 +115,33 @@ def create_slot_for_me(
     return SlotResponse.model_validate(slot)
 
 
+@router.delete("/me/slots/{slot_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_slot_for_me(
+    slot_id: int,
+    current_user: User = Depends(require_roles(UserRole.SPECIALIST, UserRole.ADMIN)),
+    db: Session = Depends(get_db),
+) -> Response:
+    profile = db.scalar(select(SpecialistProfile).where(SpecialistProfile.user_id == current_user.id))
+    if not profile:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Specialist profile not found")
+
+    slot = db.scalar(
+        select(TimeSlot).where(
+            TimeSlot.id == slot_id,
+            TimeSlot.specialist_id == profile.id,
+        )
+    )
+    if not slot:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Slot not found")
+
+    if slot.is_booked:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Booked slot cannot be deleted")
+
+    db.delete(slot)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @router.get("/{specialist_id}/slots", response_model=list[SlotResponse], status_code=status.HTTP_200_OK)
 def list_specialist_slots(
     specialist_id: int,
@@ -129,3 +162,60 @@ def list_specialist_slots(
 
     slots = db.scalars(query.order_by(TimeSlot.start_at).limit(limit).offset(offset)).all()
     return [SlotResponse.model_validate(slot) for slot in slots]
+
+
+@router.get(
+    "/{specialist_id}/availability",
+    response_model=list[SpecialistAvailabilityDayResponse],
+    status_code=status.HTTP_200_OK,
+)
+def get_specialist_availability(
+    specialist_id: int,
+    date_from: date | None = Query(default=None),
+    days: int = Query(default=7, ge=1, le=31),
+    db: Session = Depends(get_db),
+) -> list[SpecialistAvailabilityDayResponse]:
+    specialist = db.scalar(select(SpecialistProfile).where(SpecialistProfile.id == specialist_id))
+    if not specialist:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Specialist not found")
+
+    start_date = date_from or datetime.now(timezone.utc).date()
+    start_of_window = datetime.combine(start_date, time.min, tzinfo=timezone.utc)
+    end_of_window = start_of_window + timedelta(days=days)
+
+    slots = db.scalars(
+        select(TimeSlot)
+        .where(
+            TimeSlot.specialist_id == specialist_id,
+            TimeSlot.start_at >= start_of_window,
+            TimeSlot.start_at < end_of_window,
+        )
+        .order_by(TimeSlot.start_at)
+    ).all()
+
+    stats: dict[date, dict[str, int]] = {
+        start_date + timedelta(days=offset): {"total": 0, "free": 0, "booked": 0}
+        for offset in range(days)
+    }
+
+    for slot in slots:
+        slot_date = slot.start_at.astimezone(timezone.utc).date()
+        day_stats = stats.get(slot_date)
+        if day_stats is None:
+            continue
+
+        day_stats["total"] += 1
+        if slot.is_booked:
+            day_stats["booked"] += 1
+        else:
+            day_stats["free"] += 1
+
+    return [
+        SpecialistAvailabilityDayResponse(
+            date=day,
+            total_slots=day_stats["total"],
+            free_slots=day_stats["free"],
+            booked_slots=day_stats["booked"],
+        )
+        for day, day_stats in stats.items()
+    ]

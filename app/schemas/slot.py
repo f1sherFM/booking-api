@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -31,3 +31,10 @@ class SpecialistProfileResponse(BaseModel):
     description: str | None
 
     model_config = {"from_attributes": True}
+
+
+class SpecialistAvailabilityDayResponse(BaseModel):
+    date: date
+    total_slots: int
+    free_slots: int
+    booked_slots: int

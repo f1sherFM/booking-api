@@ -43,6 +43,7 @@ API:
 - `http://localhost:8000`
 - Swagger: `http://localhost:8000/docs`
 - ReDoc: `http://localhost:8000/redoc`
+- Health: `http://localhost:8000/health`
 
 ## Tests
 ```bash
@@ -66,11 +67,16 @@ Specialists:
 - `POST /specialists/me/services` (specialist/admin)
 - `GET /specialists/{id}/services`
 - `POST /specialists/me/slots` (specialist/admin)
+- `DELETE /specialists/me/slots/{id}` (specialist/admin, only free slot)
 - `GET /specialists/{id}/slots?date=YYYY-MM-DD`
+- `GET /specialists/{id}/availability?date_from=YYYY-MM-DD&days=7`
 
 Bookings:
 - `POST /bookings` (client/admin)
+- `GET /bookings/{id}`
 - `PATCH /bookings/{id}/cancel`
+- `PATCH /bookings/{id}/reschedule`
+- `GET /bookings/{id}/calendar.ics`
 - `GET /bookings/me`
 - `GET /bookings/specialists/me`
 
@@ -82,6 +88,11 @@ Bookings filters:
 - `status=confirmed|cancelled|expired`
 - `date_from=YYYY-MM-DD`
 - `date_to=YYYY-MM-DD`
+
+Specialist bookings list (`GET /bookings/specialists/me`) includes summary fields:
+- `client_email`
+- `slot_start_at`
+- `slot_end_at`
 
 ## Background Tasks
 - `bookings.expire_started_slots`  

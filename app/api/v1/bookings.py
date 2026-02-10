@@ -10,9 +10,14 @@ from app.api.deps import get_current_user, require_roles
 from app.api.pagination import LimitParam, OffsetParam
 from app.db.models import Booking, BookingStatus, SpecialistProfile, TimeSlot, User, UserRole
 from app.db.session import get_db
-from app.schemas.booking import BookingCreateRequest, BookingResponse
+from app.schemas.booking import (
+    BookingCreateRequest,
+    BookingRescheduleRequest,
+    BookingResponse,
+    SpecialistBookingSummaryResponse,
+)
 from app.services.calendar_service import build_booking_calendar_ics
-from app.services.booking_service import create_booking_for_slot
+from app.services.booking_service import create_booking_for_slot, reschedule_booking
 
 router = APIRouter(prefix="/bookings", tags=["bookings"])
 
@@ -78,6 +83,35 @@ def cancel_booking(
     db.commit()
     db.refresh(booking)
     return BookingResponse.model_validate(booking)
+
+
+@router.patch("/{booking_id}/reschedule", response_model=BookingResponse, status_code=status.HTTP_200_OK)
+def reschedule_existing_booking(
+    booking_id: int,
+    payload: BookingRescheduleRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> BookingResponse:
+    booking = db.scalar(select(Booking).where(Booking.id == booking_id))
+    if not booking:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
+
+    current_slot = db.scalar(select(TimeSlot).where(TimeSlot.id == booking.slot_id))
+    if not current_slot:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Slot not found")
+
+    allowed = current_user.role == UserRole.ADMIN.value or booking.client_id == current_user.id
+    if not allowed:
+        specialist = db.scalar(
+            select(SpecialistProfile).where(SpecialistProfile.id == current_slot.specialist_id)
+        )
+        if specialist and specialist.user_id == current_user.id:
+            allowed = True
+    if not allowed:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not enough permissions")
+
+    updated_booking = reschedule_booking(db=db, booking_id=booking_id, new_slot_id=payload.slot_id)
+    return BookingResponse.model_validate(updated_booking)
 
 
 @router.get("/{booking_id}/calendar.ics", status_code=status.HTTP_200_OK)
@@ -147,7 +181,11 @@ def list_my_bookings(
     return [BookingResponse.model_validate(booking) for booking in bookings]
 
 
-@router.get("/specialists/me", response_model=list[BookingResponse], status_code=status.HTTP_200_OK)
+@router.get(
+    "/specialists/me",
+    response_model=list[SpecialistBookingSummaryResponse],
+    status_code=status.HTTP_200_OK,
+)
 def list_specialist_bookings(
     status_filter: BookingStatus | None = Query(default=None, alias="status"),
     date_from: date | None = Query(default=None),
@@ -156,14 +194,15 @@ def list_specialist_bookings(
     offset: OffsetParam = 0,
     current_user: User = Depends(require_roles(UserRole.SPECIALIST, UserRole.ADMIN)),
     db: Session = Depends(get_db),
-) -> list[BookingResponse]:
+) -> list[SpecialistBookingSummaryResponse]:
     profile = db.scalar(select(SpecialistProfile).where(SpecialistProfile.user_id == current_user.id))
     if not profile:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Specialist profile not found")
 
     query = (
-        select(Booking)
+        select(Booking, TimeSlot.start_at, TimeSlot.end_at, User.email)
         .join(TimeSlot, Booking.slot_id == TimeSlot.id)
+        .join(User, Booking.client_id == User.id)
         .where(TimeSlot.specialist_id == profile.id)
     )
     if status_filter:
@@ -175,5 +214,43 @@ def list_specialist_bookings(
         end_dt = datetime.combine(date_to + timedelta(days=1), time.min, tzinfo=timezone.utc)
         query = query.where(TimeSlot.start_at < end_dt)
 
-    bookings = db.scalars(query.order_by(Booking.id).limit(limit).offset(offset)).all()
-    return [BookingResponse.model_validate(booking) for booking in bookings]
+    rows = db.execute(query.order_by(Booking.id).limit(limit).offset(offset)).all()
+    return [
+        SpecialistBookingSummaryResponse(
+            id=booking.id,
+            slot_id=booking.slot_id,
+            client_id=booking.client_id,
+            status=booking.status,
+            created_at=booking.created_at,
+            cancelled_at=booking.cancelled_at,
+            client_email=client_email,
+            slot_start_at=slot_start_at,
+            slot_end_at=slot_end_at,
+        )
+        for booking, slot_start_at, slot_end_at, client_email in rows
+    ]
+
+
+@router.get("/{booking_id}", response_model=BookingResponse, status_code=status.HTTP_200_OK)
+def get_booking_by_id(
+    booking_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> BookingResponse:
+    data = db.execute(
+        select(Booking, TimeSlot, SpecialistProfile)
+        .join(TimeSlot, Booking.slot_id == TimeSlot.id)
+        .join(SpecialistProfile, TimeSlot.specialist_id == SpecialistProfile.id)
+        .where(Booking.id == booking_id)
+    ).first()
+    if not data:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
+
+    booking, _, specialist = data
+    is_admin = current_user.role == UserRole.ADMIN.value
+    is_client_owner = booking.client_id == current_user.id
+    is_specialist_owner = specialist.user_id == current_user.id
+    if not (is_admin or is_client_owner or is_specialist_owner):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not enough permissions")
+
+    return BookingResponse.model_validate(booking)

@@ -9,6 +9,8 @@ from app.db.models import Booking, BookingStatus, TimeSlot
 LOCK_CONFLICT_DETAIL = "Slot booking is in progress. Retry the request."
 SLOT_ALREADY_BOOKED_DETAIL = "Slot already booked"
 IDEMPOTENCY_KEY_REUSE_DETAIL = "Idempotency key already used with another slot"
+BOOKING_NOT_RESCHEDULABLE_DETAIL = "Only confirmed bookings can be rescheduled"
+SLOT_SPECIALIST_MISMATCH_DETAIL = "New slot must belong to the same specialist"
 PG_LOCK_NOT_AVAILABLE_SQLSTATE = "55P03"
 
 
@@ -120,3 +122,56 @@ def create_booking_for_slot(
                     ) from None
                 return existing_booking
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=SLOT_ALREADY_BOOKED_DETAIL) from None
+
+
+def reschedule_booking(db: Session, booking_id: int, new_slot_id: int) -> Booking:
+    try:
+        booking_query = select(Booking).where(Booking.id == booking_id)
+        if _is_postgresql_session(db):
+            booking_query = booking_query.with_for_update(nowait=True)
+
+        booking = db.scalar(booking_query)
+        if not booking:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found")
+
+        if booking.status != BookingStatus.CONFIRMED.value:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=BOOKING_NOT_RESCHEDULABLE_DETAIL)
+
+        current_slot_id = booking.slot_id
+        if current_slot_id == new_slot_id:
+            return booking
+
+        slot_ids = sorted({current_slot_id, new_slot_id})
+        slots_query = select(TimeSlot).where(TimeSlot.id.in_(slot_ids)).order_by(TimeSlot.id)
+        if _is_postgresql_session(db):
+            slots_query = slots_query.with_for_update(nowait=True)
+
+        locked_slots = db.scalars(slots_query).all()
+        slots_by_id = {slot.id: slot for slot in locked_slots}
+
+        current_slot = slots_by_id.get(current_slot_id)
+        if not current_slot:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Current slot not found")
+
+        new_slot = slots_by_id.get(new_slot_id)
+        if not new_slot:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Slot not found")
+
+        if new_slot.specialist_id != current_slot.specialist_id:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=SLOT_SPECIALIST_MISMATCH_DETAIL)
+
+        if new_slot.is_booked:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=SLOT_ALREADY_BOOKED_DETAIL)
+
+        current_slot.is_booked = False
+        new_slot.is_booked = True
+        booking.slot_id = new_slot.id
+
+        db.commit()
+        db.refresh(booking)
+        return booking
+    except OperationalError as exc:
+        db.rollback()
+        if _is_pg_lock_not_available(exc):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=LOCK_CONFLICT_DETAIL) from None
+        raise
