@@ -79,6 +79,9 @@ Bookings:
 - `GET /bookings/{id}/calendar.ics`
 - `GET /bookings/me`
 - `GET /bookings/specialists/me`
+- `POST /bookings/wait-list`
+- `GET /bookings/wait-list/me`
+- `DELETE /bookings/wait-list/{entry_id}`
 
 List endpoints support:
 - `limit`
@@ -96,7 +99,7 @@ Specialist bookings list (`GET /bookings/specialists/me`) includes summary field
 
 ## Background Tasks
 - `bookings.expire_started_slots`  
-  Переводит устаревшие `confirmed` в `expired` и освобождает слот.
+  Переводит устаревшие `confirmed` в `expired`, освобождает слот и пытается автоматически продвинуть первого клиента из wait list.
 - `bookings.remind_upcoming`  
   Считает брони в окне напоминаний.
 
