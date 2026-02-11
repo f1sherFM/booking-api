@@ -16,7 +16,7 @@ from app.core.logging import setup_logging
 from app.core.metrics import REQUEST_COUNT, REQUEST_LATENCY, render_metrics
 from app.core.request_context import request_id_ctx_var
 
-app = FastAPI(title="Booking API", version="0.3.1")
+app = FastAPI(title="Booking API", version="0.3.2")
 app.add_exception_handler(HTTPException, http_exception_handler)
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
 setup_logging()
