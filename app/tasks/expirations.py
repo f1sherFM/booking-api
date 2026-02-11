@@ -7,6 +7,7 @@ from app.core.config import settings
 from app.db.models import Booking, BookingStatus, TimeSlot
 from app.db.session import SessionLocal
 from app.tasks.celery_app import celery_app
+from app.services.wait_list_service import promote_next_wait_list_entry
 
 
 def expire_started_slots(db: Session, now: datetime | None = None) -> int:
@@ -29,6 +30,10 @@ def expire_started_slots(db: Session, now: datetime | None = None) -> int:
 
     if stale_bookings:
         db.commit()
+
+    for booking in stale_bookings:
+        promote_next_wait_list_entry(db=db, slot_id=booking.slot_id)
+
     return len(stale_bookings)
 
 

@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, require_roles
 from app.api.pagination import LimitParam, OffsetParam
-from app.db.models import Booking, BookingStatus, SpecialistProfile, TimeSlot, User, UserRole
+from app.db.models import Booking, BookingStatus, SpecialistProfile, TimeSlot, User, UserRole, WaitListEntry
 from app.db.session import get_db
 from app.schemas.booking import (
     BookingCreateRequest,
@@ -16,8 +16,10 @@ from app.schemas.booking import (
     BookingResponse,
     SpecialistBookingSummaryResponse,
 )
+from app.schemas.wait_list import WaitListCreateRequest, WaitListEntryResponse
 from app.services.calendar_service import build_booking_calendar_ics
 from app.services.booking_service import create_booking_for_slot, reschedule_booking
+from app.services.wait_list_service import add_client_to_wait_list, promote_next_wait_list_entry
 
 router = APIRouter(prefix="/bookings", tags=["bookings"])
 
@@ -76,11 +78,17 @@ def cancel_booking(
     if not allowed:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not enough permissions")
 
+    was_cancelled_now = False
     if booking.status != BookingStatus.CANCELLED.value:
         booking.cancel()
         slot.is_booked = False
+        was_cancelled_now = True
 
     db.commit()
+
+    if was_cancelled_now:
+        promote_next_wait_list_entry(db=db, slot_id=slot.id)
+
     db.refresh(booking)
     return BookingResponse.model_validate(booking)
 
@@ -229,6 +237,52 @@ def list_specialist_bookings(
         )
         for booking, slot_start_at, slot_end_at, client_email in rows
     ]
+
+
+@router.post("/wait-list", response_model=WaitListEntryResponse, status_code=status.HTTP_201_CREATED)
+def join_wait_list(
+    payload: WaitListCreateRequest,
+    current_user: User = Depends(require_roles(UserRole.CLIENT, UserRole.ADMIN)),
+    db: Session = Depends(get_db),
+) -> WaitListEntryResponse:
+    entry = add_client_to_wait_list(db=db, slot_id=payload.slot_id, client_id=current_user.id)
+    return WaitListEntryResponse.model_validate(entry)
+
+
+@router.get("/wait-list/me", response_model=list[WaitListEntryResponse], status_code=status.HTTP_200_OK)
+def list_my_wait_list(
+    limit: LimitParam = 20,
+    offset: OffsetParam = 0,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[WaitListEntryResponse]:
+    entries = db.scalars(
+        select(WaitListEntry)
+        .where(WaitListEntry.client_id == current_user.id)
+        .order_by(WaitListEntry.created_at, WaitListEntry.id)
+        .limit(limit)
+        .offset(offset)
+    ).all()
+    return [WaitListEntryResponse.model_validate(entry) for entry in entries]
+
+
+@router.delete("/wait-list/{entry_id}", status_code=status.HTTP_204_NO_CONTENT)
+def leave_wait_list(
+    entry_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    entry = db.scalar(select(WaitListEntry).where(WaitListEntry.id == entry_id))
+    if not entry:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Wait list entry not found")
+
+    is_admin = current_user.role == UserRole.ADMIN.value
+    if not (is_admin or entry.client_id == current_user.id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not enough permissions")
+
+    db.delete(entry)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/{booking_id}", response_model=BookingResponse, status_code=status.HTTP_200_OK)
